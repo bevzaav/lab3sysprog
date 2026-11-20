@@ -1,0 +1,7 @@
+build/
+minic
+web/data.js
+demo/out/
+.DS_Store
+docs/
+*.pdf

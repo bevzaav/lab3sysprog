@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>MiniC: AST viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#fafafa;--fg:#1a1a1a;--panel:#fff;--line:#d8d8d8;--muted:#666;
+--c-decl:#7b5cd6;--c-stmt:#2f7bd8;--c-expr:#e08a1e;--c-lit:#2a9d5c;--c-func:#c0392b;--c-call:#d6336c}
+@media (prefers-color-scheme: dark){:root{--bg:#16181c;--fg:#e8e8e8;--panel:#1e2127;--line:#383c44;--muted:#9aa}}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Helvetica Neue",Arial,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:15px;margin:0 8px 0 0}
+select,button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);cursor:pointer}
+button:hover{border-color:#2f7bd8}
+main{flex:1;display:grid;grid-template-columns:minmax(260px,30%) 1fr;min-height:0}
+aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+.tabs{display:flex;border-bottom:1px solid var(--line)}
+.tabs button{flex:1;border:0;border-radius:0;border-bottom:2px solid transparent}
+.tabs button.on{border-bottom-color:#2f7bd8;font-weight:600}
+pre{margin:0;padding:12px;overflow:auto;flex:1;font:12.5px/1.5 Menlo,Consolas,monospace;white-space:pre}
+#graph{position:relative;min-height:0}
+svg{width:100%;height:100%;display:block;cursor:grab}
+.link{fill:none;stroke:var(--line);stroke-width:1.4}
+.node text{font:12px Menlo,Consolas,monospace;fill:var(--fg);paint-order:stroke;stroke:var(--bg);stroke-width:3px}
+.node circle{stroke:var(--bg);stroke-width:2px;cursor:pointer}
+.node.collapsed circle{stroke:var(--fg);stroke-width:2.5px}
+.legend{position:absolute;right:12px;top:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px}
+.legend div{display:flex;align-items:center;gap:6px;margin:2px 0}
+.legend i{width:11px;height:11px;border-radius:50%;display:inline-block}
+.hint{position:absolute;left:12px;bottom:10px;font-size:12px;color:var(--muted)}
+#tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);padding:4px 8px;border-radius:6px;font-size:12px;display:none}
+@media (max-width:800px){main{grid-template-columns:1fr;grid-template-rows:40% 1fr}aside{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>MiniC &rarr; AST</h1>
+  <label>Приклад: <select id="example"></select></label>
+  <button id="expand">Розгорнути все</button>
+  <button id="collapse">Згорнути до рівня 3</button>
+  <button id="fit">Вмістити</button>
+  <label>Файл JSON: <input type="file" id="file" accept=".json"></label>
+</header>
+<main>
+  <aside>
+    <div class="tabs">
+      <button data-tab="source" class="on">C код</button>
+      <button data-tab="python">Python</button>
+      <button data-tab="output">Вивід</button>
+    </div>
+    <pre id="code"></pre>
+  </aside>
+  <section id="graph">
+    <svg id="svg"></svg>
+    <div class="legend" id="legend"></div>
+    <div class="hint">клік по вузлу: згорнути/розгорнути · колесо: масштаб · перетягування: рух</div>
+    <div id="tip"></div>
+  </section>
+</main>
+<script src="d3.min.js"></script>
+<script src="data.js"></script>
+<script>
+const CATEGORY = {
+  Program:"decl", Declarations:"decl", Declaration:"decl",
+  Function:"func",
+  Block:"stmt", ExprStmt:"stmt", Empty:"stmt", If:"stmt", While:"stmt", DoWhile:"stmt", For:"stmt", Return:"stmt", Break:"stmt", Continue:"stmt", Print:"stmt",
+  Number:"lit", String:"lit",
+  Variable:"expr", BinaryOp:"expr", UnaryOp:"expr", Assign:"expr", IncDec:"expr", Ternary:"expr",
+  Call:"call"
+};
+const COLOR = {decl:"var(--c-decl)", func:"var(--c-func)", stmt:"var(--c-stmt)", expr:"var(--c-expr)", lit:"var(--c-lit)", call:"var(--c-call)"};
+const NAMES = {decl:"оголошення", func:"функція", stmt:"оператор", expr:"вираз", lit:"літерал", call:"виклик функції"};
+
+document.getElementById("legend").innerHTML = Object.keys(COLOR).map(k =>
+  `<div><i style="background:${COLOR[k]}"></i>${NAMES[k]}</div>`).join("");
+
+const svg = d3.select("#svg");
+const g = svg.append("g");
+const tip = document.getElementById("tip");
+let root, current = null, source = "", python = "", output = "", tab = "source";
+
+const zoom = d3.zoom().scaleExtent([0.1, 3]).on("zoom", e => g.attr("transform", e.transform));
+svg.call(zoom);
+
+function prepare(data) {
+  root = d3.hierarchy(data, d => d.children);
+  root.each(d => { d._children = d.children; });
+  update(root, true);
+}
+
+function update(src, fit) {
+  const layout = d3.tree().nodeSize([24, 160]);
+  layout(root);
+  const nodes = root.descendants(), links = root.links();
+  g.selectAll("*").remove();
+  g.selectAll(".link").data(links).enter().append("path").attr("class", "link")
+    .attr("d", d3.linkHorizontal().x(d => d.y).y(d => d.x));
+  const n = g.selectAll(".node").data(nodes).enter().append("g")
+    .attr("class", d => "node" + (d._children && !d.children ? " collapsed" : ""))
+    .attr("transform", d => `translate(${d.y},${d.x})`);
+  n.append("circle").attr("r", 6).attr("fill", d => COLOR[CATEGORY[d.data.kind] || "expr"])
+    .on("click", (e, d) => { toggle(d); })
+    .on("mousemove", (e, d) => {
+      tip.style.display = "block";
+      tip.style.left = (e.offsetX + 14) + "px";
+      tip.style.top = (e.offsetY + 14) + "px";
+      tip.textContent = d.data.kind + " · рядок " + d.data.line;
+    })
+    .on("mouseleave", () => tip.style.display = "none");
+  n.append("text").attr("dy", "0.32em").attr("x", d => (d.children || d._children) ? -10 : 10)
+    .attr("text-anchor", d => (d.children || d._children) ? "end" : "start")
+    .text(d => d.data.label.length > 34 ? d.data.label.slice(0, 33) + "…" : d.data.label);
+  if (fit) fitView();
+}
+
+function toggle(d) {
+  if (d.children) { d.children = null; }
+  else if (d._children) { d.children = d._children; }
+  update(root, false);
+}
+
+function setAll(open, depth) {
+  root.each(d => {
+    if (!d._children) return;
+    d.children = (open || d.depth < depth) ? d._children : null;
+  });
+  update(root, true);
+}
+
+function fitView() {
+  const el = document.getElementById("graph");
+  const b = g.node().getBBox();
+  const w = el.clientWidth, h = el.clientHeight;
+  const k = Math.min(1, 0.92 * Math.min(w / (b.width || 1), h / (b.height || 1)));
+  const tx = (w - b.width * k) / 2 - b.x * k;
+  const ty = (h - b.height * k) / 2 - b.y * k;
+  svg.call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(k));
+}
+
+function showTab(name) {
+  tab = name;
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
+  document.getElementById("code").textContent = {source, python, output}[name] || "(порожньо)";
+}
+
+function load(ex) {
+  current = ex;
+  source = ex.source || ""; python = ex.python || ""; output = ex.output || "";
+  prepare(ex.ast);
+  showTab(tab);
+}
+
+const sel = document.getElementById("example");
+(window.MINIC_EXAMPLES || []).forEach((ex, i) => {
+  const o = document.createElement("option");
+  o.value = i; o.textContent = ex.name + ".c";
+  sel.appendChild(o);
+});
+sel.onchange = () => load(window.MINIC_EXAMPLES[sel.value]);
+document.getElementById("expand").onclick = () => setAll(true);
+document.getElementById("collapse").onclick = () => setAll(false, 3);
+document.getElementById("fit").onclick = fitView;
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  f.text().then(t => load({name: f.name, ast: JSON.parse(t)}));
+};
+window.addEventListener("resize", fitView);
+
+if (window.MINIC_EXAMPLES && window.MINIC_EXAMPLES.length) load(window.MINIC_EXAMPLES[0]);
+else document.getElementById("code").textContent = "Немає data.js. Запусти: make view";
+</script>
+</body>
+</html>
